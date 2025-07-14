@@ -27,7 +27,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.basicConfig(level=logging.INFO, format='[VTX] %(message)s')
 logger = logging.getLogger("vtx")
 
-VT_API_KEYS = [""]
+VT_API_KEYS = [""]  # Primary VT key(s)
+VT_SECONDARY_KEY = ""  # Use this for file/download-only checks
 GSB_API_KEY = ""
 TIMEOUT = 5
 ua = UserAgent()
@@ -48,22 +49,28 @@ def is_tracker_or_ad(url):
 def hash_str(s): 
     return hashlib.sha256(s.encode()).hexdigest()
 
-def check_virustotal(url):
+def vt_check(url, api_key):
     url_id = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
     analysis_url = f"https://www.virustotal.com/api/v3/urls/{url_id}"
+    try:
+        headers = {"x-apikey": api_key}
+        headers.update(get_spoofed_headers())
+        r = requests.get(analysis_url, headers=headers, timeout=5, verify=False)
+        if r.status_code == 200:
+            data = r.json()
+            stats = data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
+            return stats.get("malicious", 0) > 0 or stats.get("suspicious", 0) > 0
+    except Exception:
+        pass
+    return None
+
+def check_virustotal(url):
     for api_key in VT_API_KEYS:
         if not api_key:
             continue
-        try:
-            headers = {"x-apikey": api_key}
-            headers.update(get_spoofed_headers())
-            r = requests.get(analysis_url, headers=headers, timeout=5, verify=False)
-            if r.status_code == 200:
-                data = r.json()
-                stats = data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
-                return stats.get("malicious", 0) > 0 or stats.get("suspicious", 0) > 0
-        except Exception:
-            continue
+        vt = vt_check(url, api_key)
+        if vt is not None:
+            return vt
     return None
 
 def check_gsb(url):
@@ -89,13 +96,13 @@ def check_gsb(url):
 
 SAFE_BLOCK_HTML = """
 <!DOCTYPE html>
-<html lang=\"en\">
-<head><meta charset=\"utf-8\"><title>Blocked by VTX Antivirus</title>
+<html lang="en">
+<head><meta charset="utf-8"><title>Blocked by VTX Antivirus</title>
 <style>body{background:#181818;color:#fff;font-family:monospace;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.box{background:#222;padding:32px;border-radius:12px;box-shadow:0 6px 24px #0008;text-align:center}h1{color:#ff0}.danger{color:#f00;font-size:1.2em}.tip{color:#0ff;margin-top:1.6em}button{margin-top:2em;padding:12px 30px;font-weight:bold;background:#f00;border:none;color:white;border-radius:6px;cursor:pointer}</style>
-</head><body><div class=\"box\"><h1>VTX Antivirus: VIRUS ALERT</h1>
-<div class=\"danger\">Malicious content detected.<br>Access blocked for your safety.</div>
-<div class=\"tip\">Go back or proceed at your own risk.</div>
-<button onclick=\"window.location.href='about:blank'\">Go Back</button></div></body></html>
+</head><body><div class="box"><h1>VTX Antivirus: VIRUS ALERT</h1>
+<div class="danger">Malicious content detected.<br>Access blocked for your safety.</div>
+<div class="tip">Go back or proceed at your own risk.</div>
+<button onclick="window.location.href='about:blank'">Go Back</button></div></body></html>
 """
 
 class VTXAntivirusOverlay:
@@ -103,9 +110,10 @@ class VTXAntivirusOverlay:
         self.vt_cache = {}
         self.lock = threading.Lock()
 
-    def scan_virus(self, url, urlid):
-        vt = check_virustotal(url)
-        if vt is None:
+    def scan_virus(self, url, urlid, download_scan=False):
+        # Use secondary key if download scan
+        vt = vt_check(url, VT_SECONDARY_KEY if download_scan else VT_API_KEYS[0]) if download_scan and VT_SECONDARY_KEY else check_virustotal(url)
+        if vt is None and not download_scan:
             vt = check_gsb(url)
         with self.lock:
             self.vt_cache[urlid] = vt
@@ -124,6 +132,7 @@ class VTXAntivirusOverlay:
         is_download = "attachment" in content_disp or "filename=" in content_disp
         urlid = hash_str(url)
 
+        # Ad/tracker blocking
         if is_tracker_or_ad(url):
             ctx.log.info(f"[VTX] Tracker/Ad blocked: {url}")
             flow.response.text = "<html><body><h2>Ad/Tracker blocked by VTX</h2></body></html>"
@@ -131,6 +140,18 @@ class VTXAntivirusOverlay:
             flow.response.status_code = 403
             return
 
+        # Skip cache for downloads: always check with secondary key
+        if is_download:
+            ctx.log.info(f"[VTX] Download detected: {url}")
+            result = self.scan_virus(url, urlid, download_scan=True)
+            if result:
+                ctx.log.warn(f"[VTX] File download is malicious: {url}")
+                self.block_download(flow)
+            else:
+                ctx.log.info(f"[VTX] File download is clean: {url}")
+            return
+
+        # Check cached result or scan normally
         virus_detected = self.vt_cache.get(urlid, None)
         if virus_detected is None:
             t = threading.Thread(target=self.scan_virus, args=(url, urlid))
@@ -139,13 +160,14 @@ class VTXAntivirusOverlay:
             virus_detected = self.vt_cache.get(urlid, None)
 
         if virus_detected is True:
-            ctx.log.info(f"VIRUS ALERT: {url}")
+            ctx.log.warn(f"[VTX] VIRUS ALERT: {url}")
             if is_html:
                 flow.response.text = SAFE_BLOCK_HTML
                 flow.response.headers["content-type"] = "text/html; charset=utf-8"
             else:
                 self.block_download(flow)
             return
+
         ctx.log.info(f"[VTX] Clean: {url}")
 
 addons = [VTXAntivirusOverlay()]
@@ -155,7 +177,7 @@ async def main():
         listen_host="0.0.0.0",
         listen_port=8080,
         ssl_insecure=True,
-        confdir="/tmp/vtx"
+        confdir="/home/ntb/certs"
     )
     m = DumpMaster(options=opts)
     for addon in addons:
