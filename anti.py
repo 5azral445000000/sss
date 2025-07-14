@@ -1,3 +1,4 @@
+add to this IP MASKING + ad and TRACKER BLOCKING + USERAGENT hiding             please put real using tor circuit or i dont know put real logic Můžeš použít Tor klienta (Tor Browser nebo systémový Tor daemon), který běží jako speciální proxy na localhostu (většinou port 9050/9051).
 from mitmproxy import http
 from mitmproxy import ctx
 import requests
@@ -12,9 +13,6 @@ import asyncio
 from mitmproxy.tools.dump import DumpMaster
 from mitmproxy.options import Options
 import urllib3
-import random
-from stem import Signal
-from stem.control import Controller
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.basicConfig(level=logging.INFO, format='[VTX] %(message)s')
@@ -27,62 +25,11 @@ GSB_API_KEY = ""
 
 TIMEOUT = 5
 
-TOR_SOCKS_HOST = "127.0.0.1"
-TOR_SOCKS_PORT = 9050
-TOR_CONTROL_PORT = 9051
-TOR_PASSWORD = "your_password"  # Set this in your torrc and here
-
-# Common ad and tracker domains/patterns (expand as needed)
-AD_TRACKER_PATTERNS = [
-    "doubleclick.net", "adservice.google.com", "adserver.", "googlesyndication.", "ads.", "pixel.", "tracking.",
-    "facebook.com/tr/", "analytics.", "googletagmanager.", "scorecardresearch.com", "quantserve.com", "adnxs.com",
-    "criteo.com", "taboola.com", "outbrain.com", "clickserve.", "bidswitch.net", "bluekai.com",
-]
-
 def hash_str(s): 
     return hashlib.sha256(s.encode()).hexdigest()
 
-def is_ad_or_tracker(url):
-    for pattern in AD_TRACKER_PATTERNS:
-        if pattern in url:
-            return True
-    return False
-
-def get_random_useragent():
-    agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0"
-    ]
-    return random.choice(agents)
-
-def renew_tor_ip():
-    try:
-        with Controller.from_port(port=TOR_CONTROL_PORT) as controller:
-            controller.authenticate(password=TOR_PASSWORD)
-            controller.signal(Signal.NEWNYM)
-            logger.info("[VTX] Tor IP renewed (NEWNYM signal sent).")
-    except Exception as e:
-        logger.error(f"[VTX] Error renewing Tor IP: {e}")
-
-def tor_session():
-    session = requests.Session()
-    session.proxies = {
-        'http': f'socks5h://{TOR_SOCKS_HOST}:{TOR_SOCKS_PORT}',
-        'https': f'socks5h://{TOR_SOCKS_HOST}:{TOR_SOCKS_PORT}',
-    }
-    return session
-
-def tor_request(method, url, **kwargs):
-    session = tor_session()
-    try:
-        return session.request(method, url, timeout=5, verify=False, **kwargs)
-    except Exception as e:
-        logger.info(f"Tor request error: {e}")
-        return None
-
 def check_virustotal(url):
+    scan_url = "https://www.virustotal.com/api/v3/urls"
     url_id = base64.urlsafe_b64encode(url.encode()).decode().strip("=")
     analysis_url = f"https://www.virustotal.com/api/v3/urls/{url_id}"
     for api_key in VT_API_KEYS:
@@ -90,8 +37,8 @@ def check_virustotal(url):
             continue
         try:
             headers = {"x-apikey": api_key}
-            r = tor_request("GET", analysis_url, headers=headers)
-            if r and r.status_code == 200:
+            r = requests.get(analysis_url, headers=headers, timeout=2)
+            if r.status_code == 200:
                 data = r.json()
                 stats = data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
                 malicious = stats.get("malicious", 0)
@@ -100,7 +47,7 @@ def check_virustotal(url):
                     return True
                 else:
                     return False
-            elif r and r.status_code == 429:
+            elif r.status_code == 429:
                 time.sleep(0.5)
                 continue
         except Exception:
@@ -119,8 +66,8 @@ def check_gsb(url):
         }
     }
     try:
-        r = tor_request("POST", gsb_url, json=payload)
-        if r and r.status_code == 200:
+        r = requests.post(gsb_url, json=payload, timeout=2)
+        if r.status_code == 200:
             data = r.json()
             if "matches" in data:
                 return True
@@ -130,6 +77,7 @@ def check_gsb(url):
         pass
     return None
 
+# This is a *safe* HTML warning page. No original content/scripts/styles are present!
 SAFE_BLOCK_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -162,13 +110,8 @@ class VTXAntivirusOverlay:
     def __init__(self):
         self.vt_cache = {}
         self.lock = threading.Lock()
-        self.last_ip_renew = time.time()
 
     def scan_virus(self, url, urlid):
-        # Periodically renew Tor IP (every 10 min)
-        if time.time() - self.last_ip_renew > 600:
-            renew_tor_ip()
-            self.last_ip_renew = time.time()
         vt = check_virustotal(url)
         if vt is None:
             vt = check_gsb(url)
@@ -180,20 +123,6 @@ class VTXAntivirusOverlay:
         flow.response.headers["Content-Disposition"] = "inline; filename=blocked.txt"
         flow.response.content = b"Virus detected in file download, download blocked by VTX Antivirus."
         flow.response.status_code = 403
-
-    def request(self, flow: http.HTTPFlow):
-        # Mask client IP in headers
-        flow.request.headers["X-Forwarded-For"] = "127.0.0.1"
-        flow.request.headers["X-Real-IP"] = "127.0.0.1"
-        # Hide/munge User-Agent
-        flow.request.headers["User-Agent"] = get_random_useragent()
-        # Block known ads/trackers
-        if is_ad_or_tracker(flow.request.pretty_url):
-            ctx.log.info(f"Blocked ad/tracker: {flow.request.pretty_url}")
-            flow.response = http.HTTPResponse.make(
-                403, b"Blocked by VTX Antivirus: Ad/Tracker Domain", {"Content-Type": "text/plain"}
-            )
-            return
 
     def response(self, flow: http.HTTPFlow):
         url = flow.request.pretty_url
@@ -219,13 +148,6 @@ class VTXAntivirusOverlay:
                 self.block_download(flow)
             return
 
-        # Ad/tracker blocking in response (e.g. HTML/script injection)
-        if is_html and is_ad_or_tracker(url):
-            flow.response.text = "<!-- Blocked Ad/Tracker by VTX Antivirus -->"
-            flow.response.headers["content-type"] = "text/html; charset=utf-8"
-            ctx.log.info(f"[VTX] Blocked ad/tracker in response: {url}")
-            return
-
         ctx.log.info(f"[VTX] Clean page or download: {url}")
 
 addons = [VTXAntivirusOverlay()]
@@ -249,4 +171,4 @@ async def main():
         await m.shutdown()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main()) use stem and pysocks
